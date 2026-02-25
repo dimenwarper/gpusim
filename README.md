@@ -1,6 +1,6 @@
 # gpusim
 
-A GPU simulator written in Rust, modelling the architecture of modern NVIDIA GPUs (H100/Hopper) down to the SM, warp, and thread level. The ultimate goal is to execute kernels and study scheduling, occupancy, and memory hierarchy behaviour.
+A GPU simulator written in Rust, modelling the architecture of modern NVIDIA GPUs (H100/Hopper) from the SM/warp/thread level up to multi-GPU clusters connected by NVLink and InfiniBand. The ultimate goal is to execute kernels and study scheduling, occupancy, memory hierarchy, and distributed communication behaviour.
 
 > Architecture based on: [JAX Scaling Book — GPUs](https://jax-ml.github.io/scaling-book/gpus/), NVIDIA architecture whitepapers, and [GPGPU-Sim](https://github.com/gpgpu-sim/gpgpu-sim_distribution).
 
@@ -8,19 +8,25 @@ A GPU simulator written in Rust, modelling the architecture of modern NVIDIA GPU
 
 ## Architecture Overview
 
-Modern GPUs are made up of hundreds of **Streaming Multiprocessors (SMs)** connected to a shared memory hierarchy. `gpusim` models this at three levels:
+Modern GPU clusters span three levels of hierarchy — from individual compute units inside a GPU, up through multi-GPU nodes, to multi-node clusters. `gpusim` models all three:
 
 ```
-GPU
-├── SMs (×132 on H100)
-│   ├── SMEM           — 256KB fast on-chip shared memory per SM
-│   ├── Warp Schedulers (×4 subpartitions)
-│   └── Tensor Cores   — matrix multiply-accumulate (MMA) units
-├── L2 Cache           — ~50MB shared across all SMs
-└── HBM                — 80GB high-bandwidth main memory (3.4 TB/s)
+Cluster
+├── Node 0  ─────────────────────── NVLink 4.0 (900 GB/s, all-to-all)
+│   ├── GPU 0
+│   │   ├── SMs (×132)
+│   │   │   ├── SMEM           — 256KB fast on-chip shared memory per SM
+│   │   │   ├── Warp Schedulers (×4 subpartitions)
+│   │   │   └── Tensor Cores   — matrix multiply-accumulate (MMA) units
+│   │   ├── L2 Cache           — ~50MB shared across all SMs
+│   │   └── HBM                — 80GB high-bandwidth memory (3.4 TB/s)
+│   └── GPU 1 … GPU 7
+├── Node 1  ─────────────────────── NVLink 4.0
+│   └── GPU 0 … GPU 7
+└── InfiniBand fabric (NDR 400Gb/s, fat-tree) connecting all nodes
 ```
 
-Kernels are launched with a **grid** of **thread blocks**. Each block is assigned to an SM and its threads are divided into **warps** of 32. The warp scheduler determines execution order within the SM.
+Kernels are launched with a **grid** of **thread blocks**. Each block is assigned to an SM and its threads are divided into **warps** of 32. The warp scheduler determines execution order within the SM. Across GPUs, communication is modelled via NVLink (intra-node) and InfiniBand (inter-node) with realistic bandwidth and latency parameters.
 
 ---
 
@@ -61,6 +67,21 @@ Kernels are launched with a **grid** of **thread blocks**. Each block is assigne
 - `SmConfig::h100()` — Hopper (CC 9.0): 132 SMs, 64 warps/SM, 228KB SMEM/SM
 - `SmConfig::a100()` — Ampere (CC 8.0): 164KB SMEM/SM
 
+### Multi-GPU Clusters
+- `Cluster` — N nodes × M GPUs, NVLink intra-node + InfiniBand inter-node
+- **Point-to-point transfers** routed automatically: NVLink if same node, InfiniBand if cross-node
+- **Collective operations**: AllReduce (Ring / Tree / Direct), AllGather (Ring), Broadcast (Tree)
+- Bandwidth and latency modelled realistically; reports time, effective bandwidth, and efficiency
+- `launch_kernel_on(device, kernel, config, policy)` — run a kernel on any GPU in the cluster
+
+| Interconnect | Preset | Bandwidth | Latency |
+|---|---|---|---|
+| NVLink 4.0 (H100) | `NVLinkConfig::h100()` | 900 GB/s | 1 µs |
+| NVLink 3.0 (A100) | `NVLinkConfig::a100()` | 600 GB/s | 1 µs |
+| NDR InfiniBand | `InfiniBandConfig::ndr()` | 50 GB/s | 2 µs |
+| HDR InfiniBand | `InfiniBandConfig::hdr()` | 25 GB/s | 2 µs |
+| XDR InfiniBand | `InfiniBandConfig::xdr()` | 100 GB/s | 1.5 µs |
+
 ### Live TUI Visualizer
 - Attach to any running simulation from a **separate terminal at any time** — no need to restart the sim
 - Polls `/tmp/gpusim_live.json` every 200ms (written atomically by the executor after each block)
@@ -73,7 +94,7 @@ Kernels are launched with a **grid** of **thread blocks**. Each block is assigne
 
 ```
 src/
-├── main.rs         — Entry point; vec_add demo kernel
+├── main.rs         — Entry point; single-GPU and multi-GPU demos
 ├── lib.rs          — Module declarations
 ├── gpu.rs          — Top-level GPU struct; launch_kernel()
 ├── sm.rs           — StreamingMultiprocessor; resource tracking
@@ -85,6 +106,8 @@ src/
 ├── memory.rs       — L2Cache and HBM (sparse HashMap-backed)
 ├── warp.rs         — Warp struct (registers, PC, age)
 ├── tensor_core.rs  — TensorCore MMA unit
+├── cluster.rs      — Cluster, Node, DeviceId; transfer(), all_reduce(), all_gather()
+├── interconnect.rs — NVLinkConfig, InfiniBandConfig, transfer math, collective algorithms
 └── bin/
     └── viz.rs      — Live TUI visualizer (ratatui)
 ```
@@ -147,6 +170,34 @@ gpu.launch_kernel(&kernel, &config, SchedulingPolicy::Gto);
 gpu.launch_kernel(&kernel, &config, SchedulingPolicy::TwoLevel { active_set_size: 8 });
 ```
 
+### Multi-GPU cluster
+
+```rust
+use gpusim::cluster::{Cluster, DeviceId};
+use gpusim::interconnect::AllReduceAlgorithm;
+
+// 2 nodes × 8 H100s = 16 GPUs, NVLink 4.0 + NDR InfiniBand
+let mut cluster = Cluster::h100_dgx(2);
+
+// Point-to-point transfer: 1GB intra-node (NVLink)
+let t = cluster.transfer(DeviceId::new(0, 0), DeviceId::new(0, 1), 1 << 30);
+println!("{:.2}ms  ({:.0} GB/s)", t.time_us / 1000.0, t.effective_bandwidth_gb_s);
+// → 1.19ms  (899 GB/s)
+
+// Point-to-point transfer: 1GB inter-node (InfiniBand)
+let t = cluster.transfer(DeviceId::new(0, 0), DeviceId::new(1, 0), 1 << 30);
+println!("{:.2}ms  ({:.0} GB/s)", t.time_us / 1000.0, t.effective_bandwidth_gb_s);
+// → 21.48ms  (50 GB/s)
+
+// AllReduce: 1GB per GPU across all 16 GPUs
+let s = cluster.all_reduce(1 << 30, AllReduceAlgorithm::Ring);
+println!("{:.2}ms  efficiency={:.1}%", s.time_us / 1000.0, s.efficiency * 100.0);
+// → 40.33ms  efficiency=99.9%
+
+// Launch a kernel on a specific GPU
+cluster.launch_kernel_on(DeviceId::new(1, 3), &kernel, &config, SchedulingPolicy::Gto);
+```
+
 ### Live visualizer
 
 Start the simulation in one terminal, then attach the visualizer in another at any time:
@@ -206,6 +257,7 @@ The visualizer shows:
 - [ ] Multi-kernel / concurrent kernel execution
 - [ ] Performance metrics: IPC, memory bandwidth utilisation, stall breakdown
 - [ ] Richer visualizer: warp state timeline, per-SM drill-down, stall breakdown chart
+- [ ] Multi-GPU visualizer: per-node/per-GPU view, transfer activity, collective progress
 
 ---
 

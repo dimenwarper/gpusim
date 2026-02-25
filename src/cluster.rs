@@ -1,0 +1,265 @@
+/// Multi-GPU cluster simulation.
+///
+/// Models a cluster of nodes, each containing multiple GPUs connected by NVLink,
+/// with nodes connected to each other via an InfiniBand fat-tree fabric.
+///
+/// Topology:
+///   Cluster
+///   ├── Node 0  (GPUs 0-7, NVLink all-to-all via NVSwitch)
+///   ├── Node 1  (GPUs 0-7, NVLink all-to-all via NVSwitch)
+///   └── ...
+///       connected by InfiniBand fat-tree (NDR/HDR)
+use crate::executor::ExecutionStats;
+use crate::gpu::GPU;
+use crate::interconnect::{
+    effective_bandwidth_gb_s, transfer_time_us, AllReduceAlgorithm, CollectiveStats,
+    InfiniBandConfig, NVLinkConfig, TransferChannel, TransferStats,
+};
+use crate::kernel::{Kernel, LaunchConfig};
+use crate::scheduler::SchedulingPolicy;
+
+// ---------------------------------------------------------------------------
+// DeviceId
+// ---------------------------------------------------------------------------
+
+/// Identifies a specific GPU in the cluster by (node index, local GPU index).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DeviceId {
+    /// Index of the node within the cluster
+    pub node: usize,
+    /// Index of the GPU within the node
+    pub gpu: usize,
+}
+
+impl DeviceId {
+    pub fn new(node: usize, gpu: usize) -> Self {
+        DeviceId { node, gpu }
+    }
+}
+
+impl std::fmt::Display for DeviceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "node{}:gpu{}", self.node, self.gpu)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Node
+// ---------------------------------------------------------------------------
+
+/// A single compute node: multiple GPUs connected by NVLink via NVSwitch.
+/// All GPUs in a node can communicate at full NVLink bandwidth simultaneously.
+pub struct Node {
+    pub id: usize,
+    /// GPUs on this node
+    pub gpus: Vec<GPU>,
+    /// NVLink fabric config (all-to-all within node)
+    pub nvlink: NVLinkConfig,
+}
+
+impl Node {
+    pub fn new_h100(id: usize, num_gpus: usize, nvlink: NVLinkConfig) -> Self {
+        let gpus = (0..num_gpus).map(|_| GPU::h100()).collect();
+        Node { id, gpus, nvlink }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cluster
+// ---------------------------------------------------------------------------
+
+/// A multi-GPU cluster: multiple nodes connected by an InfiniBand fabric.
+pub struct Cluster {
+    pub nodes: Vec<Node>,
+    /// InfiniBand fabric connecting all nodes
+    pub infiniband: InfiniBandConfig,
+}
+
+impl Cluster {
+    /// Create a cluster with `num_nodes` nodes, each with `gpus_per_node` H100 GPUs.
+    pub fn new(
+        num_nodes: usize,
+        gpus_per_node: usize,
+        nvlink: NVLinkConfig,
+        infiniband: InfiniBandConfig,
+    ) -> Self {
+        let nodes = (0..num_nodes)
+            .map(|id| Node::new_h100(id, gpus_per_node, nvlink.clone()))
+            .collect();
+        Cluster { nodes, infiniband }
+    }
+
+    /// A standard DGX H100 cluster configuration:
+    /// `num_nodes` nodes × 8 H100 GPUs each, NVLink 4.0 + NDR InfiniBand.
+    pub fn h100_dgx(num_nodes: usize) -> Self {
+        Self::new(num_nodes, 8, NVLinkConfig::h100(), InfiniBandConfig::ndr())
+    }
+
+    /// Total number of GPUs in the cluster.
+    pub fn total_gpus(&self) -> usize {
+        self.nodes.iter().map(|n| n.gpus.len()).sum()
+    }
+
+    /// Get an immutable reference to a specific GPU.
+    pub fn gpu(&self, device: DeviceId) -> &GPU {
+        &self.nodes[device.node].gpus[device.gpu]
+    }
+
+    /// Get a mutable reference to a specific GPU.
+    pub fn gpu_mut(&mut self, device: DeviceId) -> &mut GPU {
+        &mut self.nodes[device.node].gpus[device.gpu]
+    }
+
+    // -----------------------------------------------------------------------
+    // Point-to-point transfers
+    // -----------------------------------------------------------------------
+
+    /// Simulate a point-to-point transfer between two GPUs.
+    ///   - Same GPU       → instant (zero time)
+    ///   - Same node      → NVLink (high bandwidth, low latency)
+    ///   - Different nodes → InfiniBand GPUDirect RDMA (lower bandwidth)
+    pub fn transfer(&self, src: DeviceId, dst: DeviceId, bytes: u64) -> TransferStats {
+        if src == dst {
+            return TransferStats::zero(TransferChannel::SameDevice);
+        }
+
+        let (bandwidth_gb_s, latency_us, channel) = if src.node == dst.node {
+            let nv = &self.nodes[src.node].nvlink;
+            (nv.bandwidth_gb_s, nv.latency_us, TransferChannel::NVLink)
+        } else {
+            let ib = &self.infiniband;
+            (ib.bandwidth_gb_s, ib.latency_us, TransferChannel::InfiniBand)
+        };
+
+        let time_us = transfer_time_us(bytes, bandwidth_gb_s, latency_us);
+        let effective_bw = effective_bandwidth_gb_s(bytes, time_us);
+
+        TransferStats { bytes, time_us, effective_bandwidth_gb_s: effective_bw, channel }
+    }
+
+    // -----------------------------------------------------------------------
+    // Collective operations
+    // -----------------------------------------------------------------------
+
+    /// Simulate an AllReduce collective across all GPUs in the cluster.
+    ///
+    /// The bottleneck link is InfiniBand for multi-node clusters, NVLink for
+    /// single-node clusters. The algorithm determines how bandwidth is used.
+    pub fn all_reduce(
+        &self,
+        bytes_per_gpu: u64,
+        algorithm: AllReduceAlgorithm,
+    ) -> CollectiveStats {
+        let n = self.total_gpus();
+        let (peak_bw, latency) = self.bottleneck_link();
+        let bw_bytes_us = peak_bw * 1_000.0;
+
+        let time_us = match &algorithm {
+            AllReduceAlgorithm::Ring => {
+                // 2 · (N-1)/N · B/bw  +  2·(N-1)·latency
+                2.0 * (n - 1) as f64 / n as f64 * bytes_per_gpu as f64 / bw_bytes_us
+                    + 2.0 * (n - 1) as f64 * latency
+            }
+            AllReduceAlgorithm::Tree => {
+                // 2 · ⌈log₂(N)⌉ · (B/bw + latency)
+                let steps = (n as f64).log2().ceil() as u32;
+                2.0 * steps as f64 * (bytes_per_gpu as f64 / bw_bytes_us + latency)
+            }
+            AllReduceAlgorithm::Direct => {
+                // 2·(N-1) · (B/bw + latency)  — naive reduce-to-root + broadcast
+                2.0 * (n - 1) as f64 * (bytes_per_gpu as f64 / bw_bytes_us + latency)
+            }
+        };
+
+        // NCCL bus bandwidth metric: 2·(N-1)/N · B / time
+        let bus_bw = if time_us > 0.0 {
+            2.0 * (n - 1) as f64 / n as f64 * bytes_per_gpu as f64 / (time_us * 1_000.0)
+        } else {
+            0.0
+        };
+
+        CollectiveStats {
+            operation: "AllReduce".to_string(),
+            algorithm: algorithm.to_string(),
+            num_gpus: n,
+            bytes_per_gpu,
+            time_us,
+            bus_bandwidth_gb_s: bus_bw,
+            efficiency: (bus_bw / peak_bw).clamp(0.0, 1.0),
+        }
+    }
+
+    /// Simulate a Broadcast: one source GPU sends `bytes` to all other GPUs.
+    /// Uses a binary-tree algorithm: ⌈log₂(N)⌉ steps.
+    pub fn broadcast(&self, src: DeviceId, bytes: u64) -> CollectiveStats {
+        let n = self.total_gpus();
+        let (peak_bw, latency) = self.bottleneck_link();
+        let bw_bytes_us = peak_bw * 1_000.0;
+        let steps = (n as f64).log2().ceil() as u32;
+        let time_us = steps as f64 * (bytes as f64 / bw_bytes_us + latency);
+        let bus_bw = effective_bandwidth_gb_s(bytes, time_us);
+
+        CollectiveStats {
+            operation: format!("Broadcast(src={})", src),
+            algorithm: "Tree".to_string(),
+            num_gpus: n,
+            bytes_per_gpu: bytes,
+            time_us,
+            bus_bandwidth_gb_s: bus_bw,
+            efficiency: (bus_bw / peak_bw).clamp(0.0, 1.0),
+        }
+    }
+
+    /// Simulate an AllGather: every GPU ends up with all N chunks concatenated.
+    /// Ring algorithm: (N-1) steps, each transferring B bytes per link.
+    /// Time ≈ (N-1)/N · B·N / bw  (total data = N·B, pipeline efficiency = (N-1)/N)
+    pub fn all_gather(&self, bytes_per_gpu: u64) -> CollectiveStats {
+        let n = self.total_gpus();
+        let (peak_bw, latency) = self.bottleneck_link();
+        let bw_bytes_us = peak_bw * 1_000.0;
+        let total_bytes = bytes_per_gpu * n as u64;
+        let time_us = (n - 1) as f64 / n as f64 * total_bytes as f64 / bw_bytes_us
+            + (n - 1) as f64 * latency;
+        let bus_bw = effective_bandwidth_gb_s(total_bytes, time_us);
+
+        CollectiveStats {
+            operation: "AllGather".to_string(),
+            algorithm: "Ring".to_string(),
+            num_gpus: n,
+            bytes_per_gpu,
+            time_us,
+            bus_bandwidth_gb_s: bus_bw,
+            efficiency: (bus_bw / peak_bw).clamp(0.0, 1.0),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Kernel launch
+    // -----------------------------------------------------------------------
+
+    /// Launch a kernel on a specific GPU in the cluster.
+    pub fn launch_kernel_on(
+        &mut self,
+        device: DeviceId,
+        kernel: &Kernel,
+        config: &LaunchConfig,
+        policy: SchedulingPolicy,
+    ) -> ExecutionStats {
+        self.nodes[device.node].gpus[device.gpu].launch_kernel(kernel, config, policy)
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    /// Returns the (bandwidth_gb_s, latency_us) of the bottleneck link:
+    /// InfiniBand for multi-node clusters, NVLink for single-node.
+    fn bottleneck_link(&self) -> (f64, f64) {
+        if self.nodes.len() > 1 {
+            (self.infiniband.bandwidth_gb_s, self.infiniband.latency_us)
+        } else {
+            let nv = &self.nodes[0].nvlink;
+            (nv.bandwidth_gb_s, nv.latency_us)
+        }
+    }
+}

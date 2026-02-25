@@ -1,5 +1,7 @@
+pub mod cluster;
 pub mod executor;
 pub mod gpu;
+pub mod interconnect;
 pub mod kernel;
 pub mod memory;
 pub mod metrics;
