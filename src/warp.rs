@@ -12,6 +12,8 @@ pub struct Warp {
     /// Register file for each thread in the warp
     pub registers: Vec<[u32; 32]>, // 32 registers per thread
     pub active: bool,
+    /// Launch timestamp — lower means older. Used by GTO for age-based priority.
+    pub age: u64,
 }
 
 impl Warp {
@@ -21,7 +23,13 @@ impl Warp {
             pc: 0,
             registers: vec![[0u32; 32]; WARP_SIZE],
             active: true,
+            age: 0,
         }
+    }
+
+    pub fn with_age(mut self, age: u64) -> Self {
+        self.age = age;
+        self
     }
 }
 

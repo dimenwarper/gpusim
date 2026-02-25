@@ -2,6 +2,8 @@ pub mod executor;
 pub mod gpu;
 pub mod kernel;
 pub mod memory;
+pub mod occupancy;
+pub mod scheduler;
 pub mod sm;
 pub mod tensor_core;
 pub mod warp;

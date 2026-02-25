@@ -1,5 +1,6 @@
 use gpusim::gpu::GPU;
 use gpusim::kernel::{Dim3, Kernel, LaunchConfig};
+use gpusim::scheduler::SchedulingPolicy;
 
 fn main() {
     let mut gpu = GPU::h100();
@@ -45,11 +46,13 @@ fn main() {
     });
 
     // Launch: 1 thread per element, 128 threads per block
+    // Using 32 registers/thread so the occupancy calculator has something to work with
     let threads_per_block = 128u32;
     let num_blocks = n.div_ceil(threads_per_block);
-    let config = LaunchConfig::new(Dim3::x(num_blocks), Dim3::x(threads_per_block));
+    let config = LaunchConfig::new(Dim3::x(num_blocks), Dim3::x(threads_per_block))
+        .with_resources(32, 0); // 32 regs/thread, no explicit SMEM
 
-    let stats = gpu.launch_kernel(&kernel, &config);
+    let stats = gpu.launch_kernel(&kernel, &config, SchedulingPolicy::Gto);
 
     // Verify results
     let mut all_correct = true;
@@ -68,7 +71,12 @@ fn main() {
     }
 
     println!(
-        "Stats: {} blocks, {} warps, {} threads executed",
-        stats.blocks_executed, stats.warps_executed, stats.threads_executed
+        "Stats: {} blocks | {} warps | {} threads | occupancy={:.1}% (limited by {}) | policy={}",
+        stats.blocks_executed,
+        stats.warps_executed,
+        stats.threads_executed,
+        stats.theoretical_occupancy * 100.0,
+        stats.occupancy_limiter,
+        stats.scheduling_policy,
     );
 }

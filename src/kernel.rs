@@ -27,16 +27,32 @@ impl Dim3 {
     }
 }
 
-/// Configuration for launching a kernel: how many blocks (grid) and
-/// how many threads per block (block).
+/// Configuration for launching a kernel: grid/block dimensions plus
+/// resource hints used by the occupancy calculator.
 pub struct LaunchConfig {
     pub grid_dim: Dim3,
     pub block_dim: Dim3,
+    /// Registers used per thread (0 = untracked)
+    pub regs_per_thread: u32,
+    /// Shared memory bytes requested per block (0 = none)
+    pub smem_per_block: u32,
 }
 
 impl LaunchConfig {
     pub fn new(grid_dim: Dim3, block_dim: Dim3) -> Self {
-        LaunchConfig { grid_dim, block_dim }
+        LaunchConfig {
+            grid_dim,
+            block_dim,
+            regs_per_thread: 0,
+            smem_per_block: 0,
+        }
+    }
+
+    /// Set register and shared memory resource hints for occupancy calculation.
+    pub fn with_resources(mut self, regs_per_thread: u32, smem_per_block: u32) -> Self {
+        self.regs_per_thread = regs_per_thread;
+        self.smem_per_block = smem_per_block;
+        self
     }
 
     /// Total number of thread blocks in the grid
