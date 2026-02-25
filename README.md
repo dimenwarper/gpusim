@@ -61,6 +61,12 @@ Kernels are launched with a **grid** of **thread blocks**. Each block is assigne
 - `SmConfig::h100()` — Hopper (CC 9.0): 132 SMs, 64 warps/SM, 228KB SMEM/SM
 - `SmConfig::a100()` — Ampere (CC 8.0): 164KB SMEM/SM
 
+### Live TUI Visualizer
+- Attach to any running simulation from a **separate terminal at any time** — no need to restart the sim
+- Polls `/tmp/gpusim_live.json` every 200ms (written atomically by the executor after each block)
+- Shows SM utilization heatmap, occupancy gauge, block progress, and kernel stats
+- Press `q` or `Esc` to quit; the simulation keeps running unaffected
+
 ---
 
 ## Module Structure
@@ -72,12 +78,15 @@ src/
 ├── gpu.rs          — Top-level GPU struct; launch_kernel()
 ├── sm.rs           — StreamingMultiprocessor; resource tracking
 ├── kernel.rs       — Dim3, LaunchConfig, ThreadCtx, Kernel
-├── executor.rs     — KernelExecutor; block + warp scheduling loop
+├── executor.rs     — KernelExecutor; block + warp scheduling loop; metrics snapshots
 ├── occupancy.rs    — SmConfig, KernelResources, max_blocks_per_sm()
 ├── scheduler.rs    — WarpState, WarpSlot, LRR/GTO/TwoLevel schedulers
+├── metrics.rs      — LiveMetrics; atomic write/read to /tmp/gpusim_live.json
 ├── memory.rs       — L2Cache and HBM (sparse HashMap-backed)
 ├── warp.rs         — Warp struct (registers, PC, age)
-└── tensor_core.rs  — TensorCore MMA unit
+├── tensor_core.rs  — TensorCore MMA unit
+└── bin/
+    └── viz.rs      — Live TUI visualizer (ratatui)
 ```
 
 ---
@@ -138,6 +147,39 @@ gpu.launch_kernel(&kernel, &config, SchedulingPolicy::Gto);
 gpu.launch_kernel(&kernel, &config, SchedulingPolicy::TwoLevel { active_set_size: 8 });
 ```
 
+### Live visualizer
+
+Start the simulation in one terminal, then attach the visualizer in another at any time:
+
+```bash
+# Terminal 1 — run simulation
+cargo run
+
+# Terminal 2 — attach visualizer (start before, during, or after)
+cargo run --bin viz
+```
+
+The visualizer shows:
+
+```
+┌─ ⚡ gpusim live monitor ─────────────────────────────────────────────────────┐
+│  kernel: vec_add   policy: GTO   status: RUNNING                             │
+├──────────────────────────────────────┬───────────────────────────────────────┤
+│ SM Utilization                       │ Stats                                 │
+│ ██ active   ░░ idle                  │ Occupancy  ████████████████ 100.0%    │
+│                                      │ Blocks     ████░░░░░░░░░░░░  3 / 8   │
+│ ██ ░░ ░░ ░░ ░░ ░░ ░░ ░░ ░░ ░░ ░░   │                                       │
+│ ░░ ░░ ░░ ░░ ░░ ░░ ░░ ░░ ░░ ░░ ░░   │ Warps:      12                        │
+│ ░░ ░░ ░░ ░░ ░░ ░░ ░░ ░░ ░░ ░░ ░░   │ Threads:    384                       │
+│ ...                                  │ Max blk/SM: 16                        │
+│  1/132 SMs active                    │ Limiter:    register file             │
+│                                      │ Grid:   (8,1,1)                       │
+│                                      │ Block:  (128,1,1)                     │
+├──────────────────────────────────────┴───────────────────────────────────────┤
+│  q / esc: quit    auto-refreshes every 200ms    reads /tmp/gpusim_live.json  │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
 ---
 
 ## Key References
@@ -163,6 +205,7 @@ gpu.launch_kernel(&kernel, &config, SchedulingPolicy::TwoLevel { active_set_size
 - [ ] Matrix multiplication kernel demo (using TensorCore MMA)
 - [ ] Multi-kernel / concurrent kernel execution
 - [ ] Performance metrics: IPC, memory bandwidth utilisation, stall breakdown
+- [ ] Richer visualizer: warp state timeline, per-SM drill-down, stall breakdown chart
 
 ---
 
