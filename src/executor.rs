@@ -12,6 +12,7 @@
 ///    or TwoLevel) and executed in that order.
 use crate::gpu::GPU;
 use crate::kernel::{Dim3, Kernel, LaunchConfig, ThreadCtx};
+use crate::metrics::{now_ms, write_metrics, LiveMetrics};
 use crate::occupancy::{max_blocks_per_sm, occupancy, KernelResources, SmConfig};
 use crate::scheduler::{SchedulingPolicy, WarpScheduler, WarpSlot};
 use crate::warp::WARP_SIZE;
@@ -93,6 +94,11 @@ impl<'a> KernelExecutor<'a> {
             sm.resource_usage = Default::default();
         }
 
+        let blocks_total = config.num_blocks();
+
+        // Write initial "running" snapshot so viz shows the kernel immediately
+        self.write_snapshot(kernel, config, &stats, blocks_total, "running");
+
         // Iterate over all blocks in the grid and assign them to SMs
         for bz in 0..config.grid_dim.z {
             for by in 0..config.grid_dim.y {
@@ -110,6 +116,9 @@ impl<'a> KernelExecutor<'a> {
                         warps,
                         smem,
                     );
+
+                    // Write snapshot: shows this SM as active while block runs
+                    self.write_snapshot(kernel, config, &stats, blocks_total, "running");
 
                     // Execute the block
                     let mut smem_buf = vec![0u8; config.smem_per_block.max(1) as usize];
@@ -137,7 +146,44 @@ impl<'a> KernelExecutor<'a> {
             stats.theoretical_occupancy * 100.0,
         );
 
+        // Write final "complete" snapshot
+        self.write_snapshot(kernel, config, &stats, blocks_total, "complete");
+
         stats
+    }
+
+    /// Snapshot current simulation state and write to the metrics file.
+    fn write_snapshot(
+        &self,
+        kernel: &Kernel,
+        config: &LaunchConfig,
+        stats: &ExecutionStats,
+        blocks_total: u32,
+        status: &str,
+    ) {
+        let sm_active_blocks = self
+            .gpu
+            .sms
+            .iter()
+            .map(|sm| sm.resource_usage.active_blocks)
+            .collect();
+
+        write_metrics(&LiveMetrics {
+            status: status.to_string(),
+            kernel_name: kernel.name.clone(),
+            scheduling_policy: self.scheduler.name().to_string(),
+            grid: [config.grid_dim.x, config.grid_dim.y, config.grid_dim.z],
+            block: [config.block_dim.x, config.block_dim.y, config.block_dim.z],
+            theoretical_occupancy: stats.theoretical_occupancy,
+            occupancy_limiter: stats.occupancy_limiter.clone(),
+            max_blocks_per_sm: stats.max_blocks_per_sm,
+            blocks_total,
+            blocks_executed: stats.blocks_executed,
+            warps_executed: stats.warps_executed,
+            threads_executed: stats.threads_executed,
+            sm_active_blocks,
+            timestamp_ms: now_ms(),
+        });
     }
 
     /// Find the SM with the most remaining block headroom (resource-availability-based

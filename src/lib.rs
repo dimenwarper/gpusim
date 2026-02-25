@@ -2,6 +2,7 @@ pub mod executor;
 pub mod gpu;
 pub mod kernel;
 pub mod memory;
+pub mod metrics;
 pub mod occupancy;
 pub mod scheduler;
 pub mod sm;
