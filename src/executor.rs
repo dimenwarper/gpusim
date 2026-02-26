@@ -120,6 +120,13 @@ impl<'a> KernelExecutor<'a> {
                     // Write snapshot: shows this SM as active while block runs
                     self.write_snapshot(kernel, config, &stats, blocks_total, "running");
 
+                    // Optional per-block pause for live visualisation
+                    if config.block_delay_ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            config.block_delay_ms,
+                        ));
+                    }
+
                     // Execute the block
                     let mut smem_buf = vec![0u8; config.smem_per_block.max(1) as usize];
                     self.execute_block(kernel, config, block_idx, &mut smem_buf, &mut stats);
@@ -183,6 +190,9 @@ impl<'a> KernelExecutor<'a> {
             threads_executed: stats.threads_executed,
             sm_active_blocks,
             timestamp_ms: now_ms(),
+            // Cluster fields are not set by the single-GPU executor;
+            // cluster.rs enriches the snapshot after launch_kernel_on() returns.
+            ..Default::default()
         });
     }
 

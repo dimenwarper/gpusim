@@ -16,6 +16,9 @@ use crate::interconnect::{
     InfiniBandConfig, NVLinkConfig, TransferChannel, TransferStats,
 };
 use crate::kernel::{Kernel, LaunchConfig};
+use crate::metrics::{
+    now_ms, read_metrics, write_metrics, CollectiveSnapshot, LiveMetrics, TransferSnapshot,
+};
 use crate::scheduler::SchedulingPolicy;
 
 // ---------------------------------------------------------------------------
@@ -118,23 +121,50 @@ impl Cluster {
     ///   - Same GPU       → instant (zero time)
     ///   - Same node      → NVLink (high bandwidth, low latency)
     ///   - Different nodes → InfiniBand GPUDirect RDMA (lower bandwidth)
+    ///
+    /// Writes a cluster metrics snapshot so the live visualizer can show the
+    /// transfer activity.
     pub fn transfer(&self, src: DeviceId, dst: DeviceId, bytes: u64) -> TransferStats {
-        if src == dst {
-            return TransferStats::zero(TransferChannel::SameDevice);
-        }
-
-        let (bandwidth_gb_s, latency_us, channel) = if src.node == dst.node {
-            let nv = &self.nodes[src.node].nvlink;
-            (nv.bandwidth_gb_s, nv.latency_us, TransferChannel::NVLink)
+        let result = if src == dst {
+            TransferStats::zero(TransferChannel::SameDevice)
         } else {
-            let ib = &self.infiniband;
-            (ib.bandwidth_gb_s, ib.latency_us, TransferChannel::InfiniBand)
+            let (bandwidth_gb_s, latency_us, channel) = if src.node == dst.node {
+                let nv = &self.nodes[src.node].nvlink;
+                (nv.bandwidth_gb_s, nv.latency_us, TransferChannel::NVLink)
+            } else {
+                let ib = &self.infiniband;
+                (ib.bandwidth_gb_s, ib.latency_us, TransferChannel::InfiniBand)
+            };
+
+            let time_us = transfer_time_us(bytes, bandwidth_gb_s, latency_us);
+            let effective_bw = effective_bandwidth_gb_s(bytes, time_us);
+            TransferStats { bytes, time_us, effective_bandwidth_gb_s: effective_bw, channel }
         };
 
-        let time_us = transfer_time_us(bytes, bandwidth_gb_s, latency_us);
-        let effective_bw = effective_bandwidth_gb_s(bytes, time_us);
+        // Write a cluster metrics snapshot for the visualizer
+        let mut m = read_metrics().unwrap_or_default();
+        self.fill_cluster_header(&mut m);
+        m.status = if result.time_us == 0.0 {
+            "idle".to_string()
+        } else {
+            "transfer".to_string()
+        };
+        m.last_transfer = Some(TransferSnapshot {
+            src: src.to_string(),
+            dst: dst.to_string(),
+            bytes_mb: bytes as f64 / 1_000_000.0,
+            time_ms: result.time_us / 1_000.0,
+            bandwidth_gb_s: if result.effective_bandwidth_gb_s.is_infinite() {
+                0.0
+            } else {
+                result.effective_bandwidth_gb_s
+            },
+            channel: result.channel.to_string(),
+        });
+        m.timestamp_ms = now_ms();
+        write_metrics(&m);
 
-        TransferStats { bytes, time_us, effective_bandwidth_gb_s: effective_bw, channel }
+        result
     }
 
     // -----------------------------------------------------------------------
@@ -178,7 +208,7 @@ impl Cluster {
             0.0
         };
 
-        CollectiveStats {
+        let stats = CollectiveStats {
             operation: "AllReduce".to_string(),
             algorithm: algorithm.to_string(),
             num_gpus: n,
@@ -186,7 +216,10 @@ impl Cluster {
             time_us,
             bus_bandwidth_gb_s: bus_bw,
             efficiency: (bus_bw / peak_bw).clamp(0.0, 1.0),
-        }
+        };
+
+        self.write_collective_snapshot(&stats);
+        stats
     }
 
     /// Simulate a Broadcast: one source GPU sends `bytes` to all other GPUs.
@@ -199,7 +232,7 @@ impl Cluster {
         let time_us = steps as f64 * (bytes as f64 / bw_bytes_us + latency);
         let bus_bw = effective_bandwidth_gb_s(bytes, time_us);
 
-        CollectiveStats {
+        let stats = CollectiveStats {
             operation: format!("Broadcast(src={})", src),
             algorithm: "Tree".to_string(),
             num_gpus: n,
@@ -207,7 +240,10 @@ impl Cluster {
             time_us,
             bus_bandwidth_gb_s: bus_bw,
             efficiency: (bus_bw / peak_bw).clamp(0.0, 1.0),
-        }
+        };
+
+        self.write_collective_snapshot(&stats);
+        stats
     }
 
     /// Simulate an AllGather: every GPU ends up with all N chunks concatenated.
@@ -222,7 +258,7 @@ impl Cluster {
             + (n - 1) as f64 * latency;
         let bus_bw = effective_bandwidth_gb_s(total_bytes, time_us);
 
-        CollectiveStats {
+        let stats = CollectiveStats {
             operation: "AllGather".to_string(),
             algorithm: "Ring".to_string(),
             num_gpus: n,
@@ -230,7 +266,10 @@ impl Cluster {
             time_us,
             bus_bandwidth_gb_s: bus_bw,
             efficiency: (bus_bw / peak_bw).clamp(0.0, 1.0),
-        }
+        };
+
+        self.write_collective_snapshot(&stats);
+        stats
     }
 
     // -----------------------------------------------------------------------
@@ -238,6 +277,14 @@ impl Cluster {
     // -----------------------------------------------------------------------
 
     /// Launch a kernel on a specific GPU in the cluster.
+    ///
+    /// After the kernel completes, the metrics snapshot is enriched with
+    /// cluster context (node count, active device, interconnect bandwidth)
+    /// so the visualizer can show both kernel stats and cluster topology.
+    ///
+    /// Transfer and collective history is preserved — the executor writes
+    /// `..Default::default()` for cluster fields, so we snapshot them
+    /// before launch and restore them afterwards.
     pub fn launch_kernel_on(
         &mut self,
         device: DeviceId,
@@ -245,7 +292,27 @@ impl Cluster {
         config: &LaunchConfig,
         policy: SchedulingPolicy,
     ) -> ExecutionStats {
-        self.nodes[device.node].gpus[device.gpu].launch_kernel(kernel, config, policy)
+        // Save any existing transfer/collective snapshots so the executor's
+        // ..Default::default() doesn't lose them.
+        let prior = read_metrics();
+        let saved_transfer = prior.as_ref().and_then(|m| m.last_transfer.clone());
+        let saved_collective = prior.as_ref().and_then(|m| m.last_collective.clone());
+
+        let stats =
+            self.nodes[device.node].gpus[device.gpu].launch_kernel(kernel, config, policy);
+
+        // Enrich the metrics snapshot written by the executor with cluster
+        // context, and restore any transfer/collective history.
+        if let Some(mut m) = read_metrics() {
+            self.fill_cluster_header(&mut m);
+            m.active_device = device.to_string();
+            m.last_transfer = m.last_transfer.or(saved_transfer);
+            m.last_collective = m.last_collective.or(saved_collective);
+            m.timestamp_ms = now_ms();
+            write_metrics(&m);
+        }
+
+        stats
     }
 
     // -----------------------------------------------------------------------
@@ -261,5 +328,33 @@ impl Cluster {
             let nv = &self.nodes[0].nvlink;
             (nv.bandwidth_gb_s, nv.latency_us)
         }
+    }
+
+    /// Populate cluster-level fields on an existing `LiveMetrics` snapshot.
+    fn fill_cluster_header(&self, m: &mut LiveMetrics) {
+        m.cluster_mode = true;
+        m.num_nodes = self.nodes.len();
+        m.gpus_per_node = self.nodes.first().map(|n| n.gpus.len()).unwrap_or(0);
+        m.nvlink_bw_gb_s =
+            self.nodes.first().map(|n| n.nvlink.bandwidth_gb_s).unwrap_or(0.0);
+        m.infiniband_bw_gb_s = self.infiniband.bandwidth_gb_s;
+    }
+
+    /// Write a metrics snapshot for a collective operation.
+    fn write_collective_snapshot(&self, stats: &CollectiveStats) {
+        let mut m = read_metrics().unwrap_or_default();
+        self.fill_cluster_header(&mut m);
+        m.status = "collective".to_string();
+        m.last_collective = Some(CollectiveSnapshot {
+            operation: stats.operation.clone(),
+            algorithm: stats.algorithm.clone(),
+            num_gpus: stats.num_gpus,
+            bytes_per_gpu_mb: stats.bytes_per_gpu as f64 / 1_000_000.0,
+            time_ms: stats.time_us / 1_000.0,
+            bus_bw_gb_s: stats.bus_bandwidth_gb_s,
+            efficiency_pct: stats.efficiency * 100.0,
+        });
+        m.timestamp_ms = now_ms();
+        write_metrics(&m);
     }
 }

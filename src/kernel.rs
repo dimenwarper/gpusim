@@ -36,6 +36,10 @@ pub struct LaunchConfig {
     pub regs_per_thread: u32,
     /// Shared memory bytes requested per block (0 = none)
     pub smem_per_block: u32,
+    /// Milliseconds to pause after writing each block's live snapshot.
+    /// Set > 0 to slow execution down for real-time visualisation.
+    /// Default: 0 (no delay — full simulation speed).
+    pub block_delay_ms: u64,
 }
 
 impl LaunchConfig {
@@ -45,6 +49,7 @@ impl LaunchConfig {
             block_dim,
             regs_per_thread: 0,
             smem_per_block: 0,
+            block_delay_ms: 0,
         }
     }
 
@@ -52,6 +57,12 @@ impl LaunchConfig {
     pub fn with_resources(mut self, regs_per_thread: u32, smem_per_block: u32) -> Self {
         self.regs_per_thread = regs_per_thread;
         self.smem_per_block = smem_per_block;
+        self
+    }
+
+    /// Set a per-block pause for live visualisation (e.g. `.with_delay(50)` = 50 ms/block).
+    pub fn with_delay(mut self, ms: u64) -> Self {
+        self.block_delay_ms = ms;
         self
     }
 

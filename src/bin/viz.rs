@@ -4,9 +4,17 @@
 ///   cargo run --bin viz
 ///
 /// Polls /tmp/gpusim_live.json every 200ms and renders a live TUI dashboard:
-///   - SM utilization heatmap (one cell per SM, green = active)
-///   - Occupancy and block progress gauges
-///   - Kernel stats (policy, grid, threads, warps, limiter)
+///
+///   Single-GPU mode:
+///     ┌ header: kernel / policy / status ──────────────────────────┐
+///     │ SM heatmap (one cell per SM)  │ Stats: occupancy, blocks … │
+///     │ q/esc: quit  …footer…                                      │
+///
+///   Cluster mode (cluster_mode = true in the snapshot):
+///     ┌ header: kernel / policy / status / active device ──────────┐
+///     │ SM heatmap (active GPU)       │ Stats: occupancy, blocks … │
+///     │ Cluster topology: node × GPU grid, last transfer, collective│
+///     │ q/esc: quit  …footer…                                      │
 ///
 /// Press q or Esc to quit. The simulation keeps running unaffected.
 use crossterm::{
@@ -67,15 +75,37 @@ fn run(
 
 fn render(f: &mut Frame, metrics: Option<&LiveMetrics>) {
     let area = f.area();
+    let is_cluster = metrics.map(|m| m.cluster_mode).unwrap_or(false);
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // header
-            Constraint::Min(0),    // main area
-            Constraint::Length(1), // footer
-        ])
-        .split(area);
+    // Cluster panel height: 2 borders + 1 topology header + num_nodes rows +
+    // 1 blank + up to 2 event lines. Minimum 7, capped at 14.
+    let cluster_height = if is_cluster {
+        let num_nodes = metrics.map(|m| m.num_nodes).unwrap_or(2);
+        (num_nodes as u16 + 6).clamp(7, 14)
+    } else {
+        0
+    };
+
+    let rows = if is_cluster {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),              // header
+                Constraint::Min(8),                 // heatmap + stats
+                Constraint::Length(cluster_height), // cluster panel
+                Constraint::Length(1),              // footer
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // header
+                Constraint::Min(0),    // heatmap + stats
+                Constraint::Length(1), // footer
+            ])
+            .split(area)
+    };
 
     render_header(f, rows[0], metrics);
 
@@ -86,7 +116,13 @@ fn render(f: &mut Frame, metrics: Option<&LiveMetrics>) {
 
     render_heatmap(f, cols[0], metrics);
     render_stats(f, cols[1], metrics);
-    render_footer(f, rows[2]);
+
+    if is_cluster {
+        render_cluster(f, rows[2], metrics.unwrap());
+        render_footer(f, rows[3]);
+    } else {
+        render_footer(f, rows[2]);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -103,23 +139,26 @@ fn render_header(f: &mut Frame, area: Rect, metrics: Option<&LiveMetrics>) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let (name, policy, status) = metrics
+    let (name, policy, status, device) = metrics
         .map(|m| {
-            (
-                m.kernel_name.as_str(),
-                m.scheduling_policy.as_str(),
-                m.status.as_str(),
-            )
+            let dev = if m.cluster_mode && !m.active_device.is_empty() {
+                m.active_device.as_str()
+            } else {
+                ""
+            };
+            (m.kernel_name.as_str(), m.scheduling_policy.as_str(), m.status.as_str(), dev)
         })
-        .unwrap_or(("—", "—", "idle"));
+        .unwrap_or(("—", "—", "idle", ""));
 
     let status_color = match status {
         "running" => Color::Green,
         "complete" => Color::Cyan,
+        "transfer" => Color::Magenta,
+        "collective" => Color::Blue,
         _ => Color::DarkGray,
     };
 
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled("  kernel: ", Style::default().fg(Color::DarkGray)),
         Span::styled(name, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         Span::styled("   policy: ", Style::default().fg(Color::DarkGray)),
@@ -129,9 +168,17 @@ fn render_header(f: &mut Frame, area: Rect, metrics: Option<&LiveMetrics>) {
             status.to_uppercase(),
             Style::default().fg(status_color).add_modifier(Modifier::BOLD),
         ),
-    ]);
+    ];
 
-    f.render_widget(Paragraph::new(line), inner);
+    if !device.is_empty() {
+        spans.push(Span::styled("   device: ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            device,
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+
+    f.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
 
 // ---------------------------------------------------------------------------
@@ -139,9 +186,13 @@ fn render_header(f: &mut Frame, area: Rect, metrics: Option<&LiveMetrics>) {
 // ---------------------------------------------------------------------------
 
 fn render_heatmap(f: &mut Frame, area: Rect, metrics: Option<&LiveMetrics>) {
-    let block = Block::default()
-        .title(" SM Utilization ")
-        .borders(Borders::ALL);
+    // When in cluster mode, label the panel with the active GPU
+    let title = metrics
+        .filter(|m| m.cluster_mode && !m.active_device.is_empty())
+        .map(|m| format!(" SM Utilization ({}) ", m.active_device))
+        .unwrap_or_else(|| " SM Utilization ".to_string());
+
+    let block = Block::default().title(title).borders(Borders::ALL);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -165,17 +216,10 @@ fn render_heatmap(f: &mut Frame, area: Rect, metrics: Option<&LiveMetrics>) {
     for row in sm_active.chunks(sms_per_row) {
         let spans: Vec<Span> = row
             .iter()
-            .enumerate()
-            .flat_map(|(_, &active)| {
-                let (symbol, color) = if active > 0 {
-                    ("██", Color::Green)
-                } else {
-                    ("░░", Color::DarkGray)
-                };
-                vec![
-                    Span::styled(symbol, Style::default().fg(color)),
-                    Span::raw(" "),
-                ]
+            .flat_map(|&active| {
+                let (symbol, color) =
+                    if active > 0 { ("██", Color::Green) } else { ("░░", Color::DarkGray) };
+                vec![Span::styled(symbol, Style::default().fg(color)), Span::raw(" ")]
             })
             .collect();
         lines.push(Line::from(spans));
@@ -184,12 +228,10 @@ fn render_heatmap(f: &mut Frame, area: Rect, metrics: Option<&LiveMetrics>) {
     // Show SM count summary below the grid
     let active_count = sm_active.iter().filter(|&&b| b > 0).count();
     lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("  {}/{} SMs active", active_count, sm_active.len()),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]));
+    lines.push(Line::from(vec![Span::styled(
+        format!("  {}/{} SMs active", active_count, sm_active.len()),
+        Style::default().fg(Color::DarkGray),
+    )]));
 
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -294,12 +336,141 @@ fn render_stats(f: &mut Frame, area: Rect, metrics: Option<&LiveMetrics>) {
 }
 
 // ---------------------------------------------------------------------------
+// Cluster panel  (only shown when cluster_mode = true)
+// ---------------------------------------------------------------------------
+
+fn render_cluster(f: &mut Frame, area: Rect, m: &LiveMetrics) {
+    let title = format!(
+        " Cluster: {} nodes × {} GPUs ({} total)  \
+         NVLink {:.0} GB/s │ InfiniBand {:.0} GB/s ",
+        m.num_nodes,
+        m.gpus_per_node,
+        m.num_nodes * m.gpus_per_node,
+        m.nvlink_bw_gb_s,
+        m.infiniband_bw_gb_s,
+    );
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // ------------------------------------------------------------------
+    // Topology grid: one row per node, one cell per GPU
+    // Active kernel GPU highlighted in yellow; others in dark gray.
+    // ------------------------------------------------------------------
+    for node_idx in 0..m.num_nodes {
+        let mut spans: Vec<Span> = vec![Span::styled(
+            format!("  Node {:2}  ", node_idx),
+            Style::default().fg(Color::DarkGray),
+        )];
+
+        for gpu_idx in 0..m.gpus_per_node {
+            let device_str = format!("node{}:gpu{}", node_idx, gpu_idx);
+            let is_active = m.active_device == device_str;
+
+            let (symbol, color, bold) = if is_active {
+                // Bright yellow block = GPU that ran / is running the kernel
+                ("██", Color::Yellow, true)
+            } else {
+                ("░░", Color::DarkGray, false)
+            };
+
+            let style = if bold {
+                Style::default().fg(color).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(color)
+            };
+            spans.push(Span::styled(symbol, style));
+            spans.push(Span::raw(" "));
+        }
+
+        // Legend hint on the first node row
+        if node_idx == 0 {
+            spans.push(Span::styled(
+                "  ██=kernel  ░░=idle",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
+        lines.push(Line::from(spans));
+    }
+
+    lines.push(Line::raw(""));
+
+    // ------------------------------------------------------------------
+    // Last point-to-point transfer
+    // ------------------------------------------------------------------
+    if let Some(t) = &m.last_transfer {
+        let chan_color = match t.channel.as_str() {
+            "NVLink" => Color::Green,
+            "InfiniBand" => Color::Blue,
+            _ => Color::DarkGray,
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  Transfer   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(t.src.clone(), Style::default().fg(Color::Cyan)),
+            Span::raw(" → "),
+            Span::styled(t.dst.clone(), Style::default().fg(Color::Cyan)),
+            Span::raw(format!("   {:.1} MB   {:.2} ms   ", t.bytes_mb, t.time_ms)),
+            Span::styled(
+                format!("{:.1} GB/s", t.bandwidth_gb_s),
+                Style::default().fg(Color::Green),
+            ),
+            Span::styled(format!("  ({})", t.channel), Style::default().fg(chan_color)),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  Transfer   —",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    // ------------------------------------------------------------------
+    // Last collective operation
+    // ------------------------------------------------------------------
+    if let Some(c) = &m.last_collective {
+        let eff_color = match c.efficiency_pct as u32 {
+            0..=60 => Color::Red,
+            61..=85 => Color::Yellow,
+            _ => Color::Green,
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  Collective ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}/{}", c.operation, c.algorithm),
+                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "   {} GPUs   {:.1} MB/GPU   {:.2} ms   ",
+                c.num_gpus, c.bytes_per_gpu_mb, c.time_ms
+            )),
+            Span::styled(
+                format!("{:.1} GB/s", c.bus_bw_gb_s),
+                Style::default().fg(Color::Green),
+            ),
+            Span::styled(
+                format!("   {:.1}%", c.efficiency_pct),
+                Style::default().fg(eff_color),
+            ),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  Collective —",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+// ---------------------------------------------------------------------------
 // Footer
 // ---------------------------------------------------------------------------
 
 fn render_footer(f: &mut Frame, area: Rect) {
     let text = Paragraph::new(Span::styled(
-        "  q / esc: quit    auto-refreshes every 200ms    reads from /tmp/gpusim_live.json",
+        "  q / esc: quit    auto-refreshes every 200ms    reads /tmp/gpusim_live.json",
         Style::default().fg(Color::DarkGray),
     ));
     f.render_widget(text, area);
